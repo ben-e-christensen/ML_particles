@@ -8,7 +8,7 @@ Paths use forward slashes (Python is fine with them on Windows).
 ```bash
 source .venv/Scripts/activate
 
-RUN="C:/Users/ben/Desktop/burst_test_2026-11-17_17_20/rpm06"   # the frame folder you're working on
+RUN="C:/Users/Ben/Desktop/burst_test_2026-11-17_17_20/rpm11"   # the frame folder you're working on
 M=bead_rf_uniform.joblib      # forest model (the trainer's guesser)
 L=bead_labels_uniform         # labels folder (one subfolder per run, made automatically)
 ```
