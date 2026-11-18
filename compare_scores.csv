@@ -1,0 +1,5 @@
+frame,model,recall,precision,missed,false,seconds
+frame_000332.png,cnn,0.9978858350951374,1.0,1,0,0.69
+frame_000332.png,forest,0.9957716701902748,0.991578947368421,2,4,2.71
+frame_000664.png,cnn,1.0,1.0,0,0,0.44
+frame_000664.png,forest,1.0,0.9957894736842106,0,2,2.69
