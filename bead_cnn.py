@@ -20,6 +20,10 @@ same frames and scores both on the held-out ones):
          (left = forest, right = CNN; green = detection, red + = your label,
           blue ring = missed bead, yellow ring = false hit)
 
+After fixing flagged frames with bead_fix_frames.py, top the model up (minutes, not an hour):
+    python bead_cnn.py train --labels bead_labels_uniform --init bead_cnn_30k.pt --hard-boost 4 \
+        --steps 3000 --out bead_cnn_fixed.pt
+
 Real model on every approved frame:
     python bead_cnn.py train --labels bead_labels_uniform --out bead_cnn.pt
 
@@ -138,6 +142,19 @@ def load_labelled(frame_dir, labels_dir):
     return out
 
 
+def hard_names(labels_dir):
+    """frames listed in <labels>/<run>/hard.txt (written by bead_fix_frames.py), as "run/frame"."""
+    out = set()
+    if not os.path.isdir(labels_dir):
+        return out
+    for r in os.listdir(labels_dir):
+        p = os.path.join(labels_dir, r, "hard.txt")
+        if os.path.exists(p):
+            with open(p) as fh:
+                out |= {f"{r}/{ln.strip()}" for ln in fh if ln.strip()}
+    return out
+
+
 def norm(x01):
     return (x01 - 0.4) / 0.25
 
@@ -168,15 +185,17 @@ def render_target(pts, n, sigma):
 
 class Sampler:
     """Random rotated / flipped / rescaled / re-lit crops from inside the drum."""
-    def __init__(self, frames, bead_px, rim, rng):
+    def __init__(self, frames, bead_px, rim, rng, weights=None):
         self.frames, self.rng = frames, rng
+        w = np.ones(len(frames)) if weights is None else np.asarray(weights, float)
+        self.p = w / w.sum()                      # how often each frame is drawn
         self.scale = WORK_PX / bead_px
         self.cx, self.cy, self.R = rim
         self.sigma = SIGMA * WORK_PX
 
     def one(self):
         rng = self.rng
-        f, g, b, rj = self.frames[rng.integers(len(self.frames))]
+        f, g, b, rj = self.frames[rng.choice(len(self.frames), p=self.p)]
         rad = self.R * np.sqrt(rng.random()); ang = rng.random() * 2 * np.pi
         c = np.array([self.cx + rad * np.cos(ang), self.cy + rad * np.sin(ang)])
         th = rng.random() * 360
@@ -223,13 +242,20 @@ def focal_loss(logit, t, w):
 
 
 # ----------------------------------------------------------------------------- train / detect
-def train(frames, setup, steps, batch, device, seed=0, log_every=250):
+def train(frames, setup, steps, batch, device, seed=0, log_every=250, every=0, callback=None,
+          weights=None, init=None, lr=2e-3):
+    """every / callback: call callback(step, net) every `every` steps (net in eval mode during it)."""
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
-    S = Sampler(frames, setup["bead_px"], setup["rim"], rng)
-    net = UNet().to(device)
-    opt = torch.optim.AdamW(net.parameters(), lr=2e-3, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=2e-3, total_steps=steps, pct_start=0.1)
+    S = Sampler(frames, setup["bead_px"], setup["rim"], rng, weights)
+    if init:                                      # fine-tune: start from an existing model's weights
+        m0 = torch.load(init, map_location=device, weights_only=True)
+        net = UNet(tuple(m0["ch"])).to(device)
+        net.load_state_dict(m0["state"])
+    else:
+        net = UNet().to(device)
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-4)
+    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=steps, pct_start=0.1)
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     net.train()
@@ -247,17 +273,38 @@ def train(frames, setup, steps, batch, device, seed=0, log_every=250):
             print(f"  step {it:5d}/{steps}  loss {np.mean(run):.3f}  ({el:.0f} s, ~{el / it * (steps - it):.0f} s left)",
                   flush=True)
             run = []
+        if every and callback and it % every == 0 and it < steps:
+            net.eval()
+            callback(it, net)
+            net.train()
     net.eval()
     return net
 
 
-def make_model(net, setup, frames):
+def make_model(net, setup, frames, T=None):
     bd.set_bead_px(setup["bead_px"])
-    T = bd.build_template([(g, b) for _, g, b, _ in frames[:8]])
+    if T is None:
+        T = bd.build_template([(g, b) for _, g, b, _ in frames[:8]])
     return dict(state=net.state_dict(), ch=list(net.ch), bead_px=float(setup["bead_px"]),
                 rim=[float(v) for v in setup["rim"]], wall=[float(v) for v in setup["wall"]],
                 template=torch.from_numpy(T), work_px=WORK_PX,
                 trained_on=[f for f, *_ in frames])
+
+
+def live_model(net, setup, T, device):
+    """model dict usable by detect_cnn straight from a network that is still training"""
+    return dict(net=net, device=device, template=T, bead_px=float(setup["bead_px"]),
+                rim=[float(v) for v in setup["rim"]], wall=[float(v) for v in setup["wall"]],
+                work_px=WORK_PX)
+
+
+def score_frames(m, hold):
+    """totals over the held-out frames: recall, precision, missed, false"""
+    nl = nd = tp = 0
+    for _, g, b, _ in hold:
+        sc = bd.score(detect_cnn(m, g)[["x", "y"]].values, b)
+        nl += sc["n_lab"]; nd += sc["n_det"]; tp += len(sc["tp_l"])
+    return dict(recall=tp / max(nl, 1), precision=tp / max(nd, 1), missed=nl - tp, false=nd - tp)
 
 
 def save_model(m, path):
@@ -302,7 +349,8 @@ def detect_cnn(m, gray, thresh=THRESH, refine=True):
                         exclude_border=False)
     xy, sc = [], []
     for i, j in pk:                                   # sub-pixel: weighted centroid of 3x3
-        ys, xs = slice(max(i - 1, 0), i + 2), slice(max(j - 1, 0), j + 2)
+        ys = slice(max(i - 1, 0), min(i + 2, hm.shape[0]))      # clipped to the map so peaks on
+        xs = slice(max(j - 1, 0), min(j + 2, hm.shape[1]))      # the edge get a matching grid
         wv = hm[ys, xs]; gy, gx = np.mgrid[ys, xs]
         xy.append(((wv * gx).sum() / wv.sum(), (wv * gy).sum() / wv.sum())); sc.append(hm[i, j])
     xy = np.array(xy).reshape(-1, 2) / s + [x0, y0]
@@ -348,6 +396,15 @@ def main():
     t.add_argument("--device", default=None, help="cuda / cpu / mps (default: best available)")
     t.add_argument("--skip-train", action="store_true",
                    help="don't train: reuse the model in --out (same --holdout) and just run the comparison")
+    t.add_argument("--eval-every", type=int, default=0,
+                   help="with --holdout: save a checkpoint and score the held-out frames every N steps "
+                        "(into <out>_report/), so one long run shows where it stops improving")
+    t.add_argument("--hard-boost", type=float, default=1.0,
+                   help="draw frames fixed with bead_fix_frames.py (hard.txt) this many times more often")
+    t.add_argument("--init", default=None,
+                   help="start from this model's weights instead of from scratch (fine-tune; use fewer steps)")
+    t.add_argument("--lr", type=float, default=None,
+                   help="peak learning rate (default 2e-3 from scratch, 5e-4 with --init)")
     t.add_argument("--crop", type=int, default=CROP, help="training crop size in work px (multiple of 16)")
     d = sub.add_parser("detect"); d.add_argument("model"); d.add_argument("frame")
     d.add_argument("--labels", default=None); d.add_argument("--thresh", type=float, default=THRESH)
@@ -396,13 +453,47 @@ def main():
         if leaked:
             raise SystemExit(f"{a.out} was trained on {leaked} - can't score on them; retrain with --holdout")
         print(f"reusing {a.out} (trained on {len(used)} frames, none of the held-out ones)")
-    else:
+    stem = os.path.splitext(a.out)[0]
+    rdir = stem + "_report"               # every output of this run goes here -> runs never overwrite
+    if hold:
+        os.makedirs(rdir, exist_ok=True)
+    prog_path = os.path.join(rdir, "progress.csv")
+    if not a.skip_train:
+        if a.eval_every and not hold:
+            raise SystemExit("--eval-every needs --holdout (it scores the held-out frames)")
         print(f"training CNN on {len(frames)} frames, {a.steps} steps x {a.batch} crops...")
+        T = bd.build_template([(g, b) for _, g, b, _ in frames[:8]])
+        if os.path.exists(prog_path):
+            os.remove(prog_path)
+
+        def checkpoint(it, net):
+            ck = os.path.join(rdir, f"{os.path.basename(stem)}_step{it:06d}.pt")
+            save_model(make_model(net, setup, frames, T), ck)
+            r = dict(step=it, **score_frames(live_model(net, setup, T, device), hold))
+            pd.DataFrame([r]).to_csv(prog_path, mode="a", header=not os.path.exists(prog_path), index=False)
+            print(f"  >> step {it}: held-out recall {100*r['recall']:.2f}%  precision {100*r['precision']:.2f}%  "
+                  f"({r['missed']} missed, {r['false']} false)  saved {ck}", flush=True)
+
         t0 = time.time()
-        net = train(frames, setup, a.steps, a.batch, device)
-        m = make_model(net, setup, frames)
+        hard = hard_names(a.labels)
+        is_hard = [f in hard for f, *_ in frames]
+        weights = [a.hard_boost if h else 1.0 for h in is_hard]
+        if any(is_hard):
+            share = sum(w for w, h in zip(weights, is_hard) if h) / sum(weights)
+            print(f"  {sum(is_hard)} hard frames (from hard.txt) drawn {a.hard_boost:g}x as often "
+                  f"-> {100*share:.0f}% of training crops")
+        lr = a.lr or (5e-4 if a.init else 2e-3)
+        if a.init:
+            print(f"  fine-tuning from {a.init} (peak learning rate {lr:g})")
+        net = train(frames, setup, a.steps, a.batch, device, every=a.eval_every, callback=checkpoint,
+                    weights=weights, init=a.init, lr=lr)
+        m = make_model(net, setup, frames, T)
         save_model(m, a.out)
         print(f"saved {a.out} ({time.time() - t0:.0f} s)")
+        if a.eval_every:
+            checkpoint_final = dict(step=a.steps, **score_frames(live_model(net, setup, T, device), hold))
+            pd.DataFrame([checkpoint_final]).to_csv(prog_path, mode="a", header=not os.path.exists(prog_path),
+                                                    index=False)
     if not hold:
         return
     m = load_cnn(a.out, a.device)
@@ -417,30 +508,35 @@ def main():
         sc = bd.score(dc, b); bd._print_score(f"  {f} CNN   ", sc)
         rows.append(dict(frame=f, model="cnn", recall=sc["recall"], precision=sc["precision"],
                          missed=len(sc["fn"]), false=len(sc["fp"]), seconds=round(tc, 2)))
-        bd.draw_check(g, b, dc, sc, crop, "_c.png",
+        tmp_c, tmp_f = os.path.join(rdir, "_c.png"), os.path.join(rdir, "_f.png")
+        bd.draw_check(g, b, dc, sc, crop, tmp_c,
                       f"CNN  recall {100*sc['recall']:.1f}%  precision {100*sc['precision']:.1f}%  "
                       f"({len(sc['fn'])} missed, {len(sc['fp'])} false)")
-        panels = [cv2.imread("_c.png")]
+        panels = [cv2.imread(tmp_c)]
         if fm is not None:
             bd.set_bead_px(setup["bead_px"])
             t0 = time.time(); df = bd.detect(fm, g)[["x", "y"]].values; tf = time.time() - t0
             sf = bd.score(df, b); bd._print_score(f"  {f} forest", sf)
             rows.append(dict(frame=f, model="forest", recall=sf["recall"], precision=sf["precision"],
                              missed=len(sf["fn"]), false=len(sf["fp"]), seconds=round(tf, 2)))
-            bd.draw_check(g, b, df, sf, crop, "_f.png",
+            bd.draw_check(g, b, df, sf, crop, tmp_f,
                           f"FOREST  recall {100*sf['recall']:.1f}%  precision {100*sf['precision']:.1f}%  "
                           f"({len(sf['fn'])} missed, {len(sf['fp'])} false)")
-            panels.insert(0, cv2.imread("_f.png"))
-        out = f"compare_{os.path.splitext(f)[0].replace('/', '__')}.png"
+            panels.insert(0, cv2.imread(tmp_f))
+        out = os.path.join(rdir, f"compare_{os.path.splitext(f)[0].replace('/', '__')}.png")
         cv2.imwrite(out, np.hstack(panels))
         print(f"  wrote {out}")
-    for p in ("_c.png", "_f.png"):
+    for p in (os.path.join(rdir, "_c.png"), os.path.join(rdir, "_f.png")):
         if os.path.exists(p):
             os.remove(p)
     df = pd.DataFrame(rows)
-    df.to_csv("compare_scores.csv", index=False)
+    df.to_csv(os.path.join(rdir, "compare_scores.csv"), index=False)
     print("\n" + df.groupby("model")[["recall", "precision", "missed", "false", "seconds"]].mean().round(3).to_string())
-    print("\n(saved compare_scores.csv). For the real model, rerun WITHOUT --holdout so it trains on every frame.")
+    if os.path.exists(prog_path):
+        print("\n=== held-out score vs training steps (totals over the held-out frames) ===")
+        print(pd.read_csv(prog_path).round(4).to_string(index=False))
+    print(f"\n(everything from this run is in {rdir}/). For the real model, rerun WITHOUT --holdout "
+          "so it trains on every frame, with the step count that scored best here.")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,7 @@
+frame,model,recall,precision,missed,false,seconds
+burst_test_2026-11-17_17_20_rpm01/frame_000620.png,cnn,1.0,1.0,0,0,0.09
+burst_test_2026-11-17_17_20_rpm06/frame_000340.png,cnn,1.0,1.0,0,0,0.09
+burst_test_2026-11-17_17_20_rpm11/frame_000220.png,cnn,1.0,1.0,0,0,0.12
+burst_test_2026-11-17_17_20_rpm16/frame_000180.png,cnn,1.0,1.0,0,0,0.13
+burst_test_2026-11-17_17_20_rpm21/frame_000100.png,cnn,1.0,1.0,0,0,0.14
+burst_test_2026-11-17_17_20_rpm26/frame_000060.png,cnn,1.0,1.0,0,0,0.16

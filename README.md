@@ -8,7 +8,7 @@ Paths use forward slashes (Python is fine with them on Windows).
 ```bash
 source .venv/Scripts/activate
 
-RUN="C:/Users/Ben/Desktop/burst_test_2026-11-17_17_20/rpm11"   # the frame folder you're working on
+RUN="C:/Users/ben/Desktop/burst_test_2026-11-17_17_20/rpm06"   # the frame folder you're working on
 M=bead_rf_uniform.joblib      # forest model (the trainer's guesser)
 L=bead_labels_uniform         # labels folder (one subfolder per run, made automatically)
 ```
@@ -39,8 +39,13 @@ Uses every run in the labels folder. About 11 min on the RTX 3060.
 # train the real model on all approved frames
 python bead_cnn.py train --labels $L --out bead_cnn.pt
 
-# fair test: hold 3 frames out, score network vs forest on them -> compare_*.png
+# fair test: hold 3 frames out, score network vs forest on them -> bead_cnn_test_report/
 python bead_cnn.py train --labels $L --holdout 3 --compare-forest --out bead_cnn_test.pt
+
+# how many steps? ONE long run that saves + scores held-out frames every 2500 steps.
+# Everything goes in bead_cnn_30k_report/ (named after --out), so runs never overwrite each other:
+#   progress.csv = held-out score at each checkpoint, *_stepNNNNNN.pt = the checkpoints
+python bead_cnn.py train --labels $L --holdout 6 --eval-every 2500 --steps 30000 --out bead_cnn_30k.pt
 
 # rerun that comparison without retraining (same --holdout)
 python bead_cnn.py train --labels $L --holdout 3 --compare-forest --out bead_cnn_test.pt --skip-train
